@@ -1,0 +1,230 @@
+!pip install azure.cognitiveservices.speech
+
+from google.colab import drive
+drive.mount('/content/gdrive/')
+
+import os
+from os import listdir
+from os.path import isfile, join
+import re
+
+try:
+    import azure.cognitiveservices.speech as speechsdk
+except ImportError:
+    print("""
+    Importing the Speech SDK for Python failed.
+    Refer to
+    https://docs.microsoft.com/azure/cognitive-services/speech-service/quickstart-python for
+    installation instructions.
+    """)
+    import sys
+    sys.exit(1)
+
+
+lang_to_detect = ["ar-EG", "sv-SE"]
+subscription_key, service_region = "insert_subscription_key", "insert_region"
+
+def initialize_speech_recognizer(file_path):
+
+  audio_config = speechsdk.AudioConfig(filename=file_path)
+
+  speech_config = speechsdk.SpeechConfig(subscription=subscription_key, region=service_region)
+
+  auto_detect_source_lang_config = speechsdk.AutoDetectSourceLanguageConfig(languages=lang_to_detect)
+
+  
+  # initializing step.
+  speech_recognizer = speechsdk.SpeechRecognizer(
+      speech_config=speech_config, 
+      auto_detect_source_language_config=auto_detect_source_lang_config, 
+      audio_config=audio_config)
+
+  return speech_recognizer
+
+# Getting the accuracy for a specific language
+def get_accuracy(language_detected_list, lang, transcript_results):
+  counter = Counter(language_detected_list)
+  accuracy = counter[lang]*100/len(transcript_results)
+  return accuracy
+
+
+def remove_special_characters(selected_language, text):
+  if selected_language == ('ar-EG'):
+    chars_to_ignore_regex = '[\'ٰ\؛\—\_get\«\»\ـ\ـ\,\?\.\!\-\;\:\"\“\%\‘\”\�\#\،\☭,\؟\'ۚ\چ\ڨ\إ\ﺃ\ھ\ﻻ\'ۖ]'
+    text = re.sub(chars_to_ignore_regex, '', text).lower() + " "    
+  else:
+    chars_to_ignore_regex = '[\,\?\.\!\-\;\:\"\“\%\‘\”\�\#\'ۖ\´]'
+    text = re.sub(chars_to_ignore_regex, '', text).lower()
+  return text
+
+
+def recognize_speech_and_get_language(speech_recognizer):
+  """ for now recognize once, TODO: make it continious with event-dependent callbacks """
+  recognized_result = speech_recognizer.recognize_once()  # this is a SpeechRecognitionResult instance and a RecognitionResult!!
+  result_text = recognized_result.text
+  result_language = speechsdk.AutoDetectSourceLanguageResult(recognized_result).language
+
+  return remove_special_characters(result_language, result_text), result_language
+
+"""speech translation """
+from_language, to_language = 'ar-EG', 'en-US'
+
+def initialize_translation_recognizer(file_path):
+
+    translation_config = speechsdk.translation.SpeechTranslationConfig(
+            subscription=subscription_key, region=service_region)
+
+    translation_config.speech_recognition_language = from_language
+    translation_config.add_target_language(to_language)
+
+    audio_config = speechsdk.audio.AudioConfig(filename=file_path)
+    
+    # initializing step
+    translation_recognizer = speechsdk.translation.TranslationRecognizer(
+        translation_config=translation_config, audio_config=audio_config)
+
+    return translation_recognizer
+
+    
+def get_result_text(translation_recognizer):
+  result = translation_recognizer.recognize_once()
+  result_text = result.translations.values()[0]
+
+  return result_text
+
+import csv
+import pandas as pd 
+
+#Reading the original transcript from a CSV file
+
+df = pd.read_csv('egypt1.csv')
+
+# transposing and transforming into Dict
+list_of_dicts = df.T.to_dict().values()
+rows_by_path = {
+    item.get("path"): item
+    for item in list_of_dicts
+}
+
+test_files = os.listdir()
+mypath = "/inser_the_path/"
+onlyfiles = [f for f in listdir(mypath) if isfile(join(mypath, f))][:9]
+df
+
+list_df = []
+
+from_language, to_language = "ar-EG", 'en-US'
+
+for file in onlyfiles:
+  #print(file)
+  row_in_csv_with_same_file = rows_by_path.get(file)
+
+  text, lang = recognize_speech_and_get_language(
+      initialize_speech_recognizer(f"/inser_the_path/{file}"))
+  
+  translated_speech = get_result_text(
+      initialize_translation_recognizer(f"/inser_the_path/{file}"))
+
+
+  list_df.append(
+      {"path": file, 
+       "azure": text,
+       "target": row_in_csv_with_same_file.get('sentence'),
+       "English": row_in_csv_with_same_file.get('English'),
+       "language": lang,
+       "translated": translated_speech
+      }
+  )
+
+df_result = pd.DataFrame(list_df)
+
+df_result.head()
+
+df_result['preprocessed_sentence'] = df_result['target'].apply(lambda x: remove_special_characters(from_language, x))
+df_result['preprocessed_translation'] = df_result['translated'].apply(lambda x: remove_special_characters(to_language, x))
+df_result['English'] = df_result['English'].apply(lambda x: remove_special_characters(to_language, x))
+df_result.head()
+
+# Language detection accuracy
+occurance= df_result['language'].value_counts()['ar-EG']
+accuracy = occurance*100/len(df_result['language'])
+print (accuracy)
+
+!pip install jiwer
+
+import jiwer
+from jiwer import wer
+from jiwer import mer
+
+# Compute Word Error Rate = float(S + D + I) / float(H + S + D)
+df_result['azure-WER'] = ""
+
+scores = {}
+for item in ["azure"]:
+    for index, row in df_result.iterrows():
+      if row[item] != 'fail':
+        temp = 100 * jiwer.wer(hypothesis=row[item], truth=row['preprocessed_sentence'])
+      else:
+        temp = 100
+      row[item + "-WER"] = temp
+results = {}
+for item in ["azure"]:
+  wer = item + "-WER"
+  mean = df_result[wer].mean()
+  results[item] = mean
+
+
+print("The WER in {} are the following: {}".format(lang, {k: v for k, v in sorted(results.items(), key=lambda item: item[1])}))
+scores[lang] = {k: v for k, v in sorted(results.items(), key=lambda item: item[1])}
+  
+# print (temp)
+
+# Compute Match Error Rate = float(S + D + I) / float(H + S + D + I)
+df_result['azure-MER'] = ""
+
+scores = {}
+for item in ["azure"]:
+    for index, row in df_result.iterrows():
+      if row[item] != 'fail':
+        temp = 100 * jiwer.mer(hypothesis=row[item], truth=row['preprocessed_sentence'])
+      else:
+        temp = 100
+      row[item + "-MER"] = temp
+results = {}
+for item in ["azure"]:
+  mer = item + "-MER"
+  mean = df_result[mer].mean()
+  results[item] = mean
+
+print("The MER in {} are the following: {}".format(lang, {k: v for k, v in sorted(results.items(), key=lambda item: item[1])}))
+scores[lang] = {k: v for k, v in sorted(results.items(), key=lambda item: item[1])}
+
+df_result
+
+!pip install sacrebleu
+
+import sacrebleu
+import statistics
+
+# getting the bleu score for the English translation 
+df_result['English-bleu'] = ""
+
+score = []
+refrence = []
+translated = []
+for item in ["English"]:
+    for index, row in df_result.iterrows():
+      refs= row[item].strip().split("\n")
+      refrence.append(refs)
+      azure=row['preprocessed_translation'].strip().split("\n")
+      score = sacrebleu.corpus_bleu(azure, refrence).score
+      row[item + "-bleu"] = score
+
+for item in ["English"]:
+  bleu = item + "-bleu"
+  mean = df_result[bleu].mean()
+  results[item] = bleu
+
+print ("the mean bleu score for Azure's translation is:", mean)
+
+# df_result.to_csv('name_the_csv.csv', index=False)
